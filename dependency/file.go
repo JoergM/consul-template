@@ -8,8 +8,6 @@ import (
 	"os"
 	"sync"
 	"time"
-
-	api "github.com/armon/consul-api"
 )
 
 type File struct {
@@ -18,7 +16,7 @@ type File struct {
 	lastStat os.FileInfo
 }
 
-func (d *File) Fetch(client *api.Client, options *api.QueryOptions) (interface{}, *api.QueryMeta, error) {
+func (d *File) Fetch(clients *ClientSet, opts *QueryOptions) (interface{}, *ResponseMetadata, error) {
 	var err error = nil
 	var data []byte
 
@@ -26,31 +24,31 @@ func (d *File) Fetch(client *api.Client, options *api.QueryOptions) (interface{}
 
 	newStat, err := d.watch()
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("file: error watching: %s", err)
 	}
 
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 	d.lastStat = newStat
 
-	fakeMeta := &api.QueryMeta{LastIndex: uint64(newStat.ModTime().Unix())}
+	ts := time.Now().Unix()
+	rm := &ResponseMetadata{
+		LastContact: time.Duration(ts),
+		LastIndex:   uint64(ts),
+	}
 
 	if data, err = ioutil.ReadFile(d.rawKey); err == nil {
-		return string(data), fakeMeta, err
+		return string(data), rm, nil
 	}
-	return "", nil, err
+	return nil, nil, fmt.Errorf("file: error reading: %s", err)
 }
 
 func (d *File) HashCode() string {
-	return fmt.Sprintf("StoreKeyPrefix|%s", d.Key())
-}
-
-func (d *File) Key() string {
-	return d.rawKey
+	return fmt.Sprintf("StoreKeyPrefix|%s", d.rawKey)
 }
 
 func (d *File) Display() string {
-	return fmt.Sprintf(`file "%s"`, d.rawKey)
+	return fmt.Sprintf(`"file(%s)"`, d.rawKey)
 }
 
 // watch watchers the file for changes

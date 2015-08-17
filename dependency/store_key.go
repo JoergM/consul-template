@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"log"
 	"regexp"
-
-	api "github.com/armon/consul-api"
 )
 
 // from inside a template.
@@ -18,40 +16,51 @@ type StoreKey struct {
 
 // Fetch queries the Consul API defined by the given client and returns string
 // of the value to Path.
-func (d *StoreKey) Fetch(client *api.Client, options *api.QueryOptions) (interface{}, *api.QueryMeta, error) {
-	if d.DataCenter != "" {
-		options.Datacenter = d.DataCenter
+func (d *StoreKey) Fetch(clients *ClientSet, opts *QueryOptions) (interface{}, *ResponseMetadata, error) {
+	if opts == nil {
+		opts = &QueryOptions{}
 	}
 
-	log.Printf("[DEBUG] (%s) querying consul with %+v", d.Display(), options)
+	consulOpts := opts.consulQueryOptions()
+	if d.DataCenter != "" {
+		consulOpts.Datacenter = d.DataCenter
+	}
 
-	store := client.KV()
-	pair, qm, err := store.Get(d.Path, options)
+	log.Printf("[DEBUG] (%s) querying consul with %+v", d.Display(), consulOpts)
+
+	consul, err := clients.Consul()
 	if err != nil {
-		return "", qm, err
+		return nil, nil, fmt.Errorf("store key: error getting client: %s", err)
+	}
+
+	store := consul.KV()
+	pair, qm, err := store.Get(d.Path, consulOpts)
+	if err != nil {
+		return "", nil, fmt.Errorf("store key: error fetching: %s", err)
+	}
+
+	rm := &ResponseMetadata{
+		LastIndex:   qm.LastIndex,
+		LastContact: qm.LastContact,
 	}
 
 	if pair == nil {
-		log.Printf("[DEBUG] (%s) Consul returned nothing (does the path exist?)",
+		log.Printf("[WARN] (%s) Consul returned no data (does the path exist?)",
 			d.Display())
-		return "", qm, nil
+		return "", rm, nil
 	}
 
 	log.Printf("[DEBUG] (%s) Consul returned %s", d.Display(), pair.Value)
 
-	return string(pair.Value), qm, nil
+	return string(pair.Value), rm, nil
 }
 
 func (d *StoreKey) HashCode() string {
-	return fmt.Sprintf("StoreKey|%s", d.Key())
-}
-
-func (d *StoreKey) Key() string {
-	return d.rawKey
+	return fmt.Sprintf("StoreKey|%s", d.rawKey)
 }
 
 func (d *StoreKey) Display() string {
-	return fmt.Sprintf(`key "%s"`, d.rawKey)
+	return fmt.Sprintf(`"key(%s)"`, d.rawKey)
 }
 
 // ParseStoreKey parses a string of the format a(/b(/c...))
@@ -61,8 +70,8 @@ func ParseStoreKey(s string) (*StoreKey, error) {
 	}
 
 	re := regexp.MustCompile(`\A` +
-		`(?P<key>[[:word:]\.\:\-\/]+)` +
-		`(@(?P<datacenter>[[:word:]\.\-]+))?` +
+		`(?P<key>[^@]+)` +
+		`(@(?P<datacenter>.+))?` +
 		`\z`)
 	names := re.SubexpNames()
 	match := re.FindAllStringSubmatch(s, -1)

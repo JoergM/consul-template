@@ -6,8 +6,6 @@ import (
 	"log"
 	"regexp"
 	"strings"
-
-	api "github.com/armon/consul-api"
 )
 
 // KeyPair is a simple Key-Value pair
@@ -15,6 +13,13 @@ type KeyPair struct {
 	Path  string
 	Key   string
 	Value string
+
+	// Lesser-used, but still valuable keys from api.KV
+	CreateIndex uint64
+	ModifyIndex uint64
+	LockIndex   uint64
+	Flags       uint64
+	Session     string
 }
 
 // StoreKeyPrefix is the representation of a requested key dependency
@@ -27,17 +32,27 @@ type StoreKeyPrefix struct {
 
 // Fetch queries the Consul API defined by the given client and returns a slice
 // of KeyPair objects
-func (d *StoreKeyPrefix) Fetch(client *api.Client, options *api.QueryOptions) (interface{}, *api.QueryMeta, error) {
-	if d.DataCenter != "" {
-		options.Datacenter = d.DataCenter
+func (d *StoreKeyPrefix) Fetch(clients *ClientSet, opts *QueryOptions) (interface{}, *ResponseMetadata, error) {
+	if opts == nil {
+		opts = &QueryOptions{}
 	}
 
-	log.Printf("[DEBUG] (%s) querying Consul with %+v", d.Display(), options)
+	consulOpts := opts.consulQueryOptions()
+	if d.DataCenter != "" {
+		consulOpts.Datacenter = d.DataCenter
+	}
 
-	store := client.KV()
-	prefixes, qm, err := store.List(d.Prefix, options)
+	log.Printf("[DEBUG] (%s) querying Consul with %+v", d.Display(), consulOpts)
+
+	consul, err := clients.Consul()
 	if err != nil {
-		return err, qm, nil
+		return nil, nil, fmt.Errorf("store key prefix: error getting client: %s", err)
+	}
+
+	store := consul.KV()
+	prefixes, qm, err := store.List(d.Prefix, consulOpts)
+	if err != nil {
+		return nil, nil, fmt.Errorf("store key prefix: error fetching: %s", err)
 	}
 
 	log.Printf("[DEBUG] (%s) Consul returned %d key pairs", d.Display(), len(prefixes))
@@ -48,25 +63,31 @@ func (d *StoreKeyPrefix) Fetch(client *api.Client, options *api.QueryOptions) (i
 		key = strings.TrimLeft(key, "/")
 
 		keyPairs = append(keyPairs, &KeyPair{
-			Path:  pair.Key,
-			Key:   key,
-			Value: string(pair.Value),
+			Path:        pair.Key,
+			Key:         key,
+			Value:       string(pair.Value),
+			CreateIndex: pair.CreateIndex,
+			ModifyIndex: pair.ModifyIndex,
+			LockIndex:   pair.LockIndex,
+			Flags:       pair.Flags,
+			Session:     pair.Session,
 		})
 	}
 
-	return keyPairs, qm, nil
+	rm := &ResponseMetadata{
+		LastIndex:   qm.LastIndex,
+		LastContact: qm.LastContact,
+	}
+
+	return keyPairs, rm, nil
 }
 
 func (d *StoreKeyPrefix) HashCode() string {
-	return fmt.Sprintf("StoreKeyPrefix|%s", d.Key())
-}
-
-func (d *StoreKeyPrefix) Key() string {
-	return d.rawKey
+	return fmt.Sprintf("StoreKeyPrefix|%s", d.rawKey)
 }
 
 func (d *StoreKeyPrefix) Display() string {
-	return fmt.Sprintf(`storeKeyPrefix "%s"`, d.rawKey)
+	return fmt.Sprintf(`"storeKeyPrefix(%s)"`, d.rawKey)
 }
 
 // ParseStoreKeyPrefix parses a string of the format a(/b(/c...))

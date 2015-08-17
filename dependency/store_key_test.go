@@ -4,18 +4,16 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/hashicorp/consul-template/test"
 )
 
 func TestStoreKeyFetch(t *testing.T) {
-	client, options := test.DemoConsulClient(t)
-	dep := &StoreKey{
-		rawKey: "global/time",
-		Path:   "global/time",
-	}
+	clients, consul := testConsulServer(t)
+	defer consul.Stop()
 
-	results, _, err := dep.Fetch(client, options)
+	consul.SetKV("foo", []byte("bar"))
+
+	dep := &StoreKey{rawKey: "foo", Path: "foo"}
+	results, _, err := dep.Fetch(clients, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,15 +59,16 @@ func TestParseStoreKey_name(t *testing.T) {
 	}
 }
 
-func TestParseStoreKey_nameColon(t *testing.T) {
-	sd, err := ParseStoreKey("config/redis:magic:80/maxconns")
+func TestParseStoreKey_nameSpecialCharacters(t *testing.T) {
+	sd, err := ParseStoreKey("config/facet:größe-lf-si@nyc1")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	expected := &StoreKey{
-		rawKey: "config/redis:magic:80/maxconns",
-		Path:   "config/redis:magic:80/maxconns",
+		rawKey:     "config/facet:größe-lf-si@nyc1",
+		Path:       "config/facet:größe-lf-si",
+		DataCenter: "nyc1",
 	}
 	if !reflect.DeepEqual(sd, expected) {
 		t.Errorf("expected %+v to equal %+v", sd, expected)

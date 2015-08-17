@@ -5,8 +5,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
-
-	api "github.com/armon/consul-api"
+	"sort"
 )
 
 // Node is a node entry in Consul
@@ -22,17 +21,27 @@ type CatalogNodes struct {
 
 // Fetch queries the Consul API defined by the given client and returns a slice
 // of Node objects
-func (d *CatalogNodes) Fetch(client *api.Client, options *api.QueryOptions) (interface{}, *api.QueryMeta, error) {
-	if d.DataCenter != "" {
-		options.Datacenter = d.DataCenter
+func (d *CatalogNodes) Fetch(clients *ClientSet, opts *QueryOptions) (interface{}, *ResponseMetadata, error) {
+	if opts == nil {
+		opts = &QueryOptions{}
 	}
 
-	log.Printf("[DEBUG] (%s) querying Consul with %+v", d.Display(), options)
+	consulOpts := opts.consulQueryOptions()
+	if d.DataCenter != "" {
+		consulOpts.Datacenter = d.DataCenter
+	}
 
-	catalog := client.Catalog()
-	n, qm, err := catalog.Nodes(options)
+	log.Printf("[DEBUG] (%s) querying Consul with %+v", d.Display(), consulOpts)
+
+	consul, err := clients.Consul()
 	if err != nil {
-		return err, qm, nil
+		return nil, nil, fmt.Errorf("catalog nodes: error getting client: %s", err)
+	}
+
+	catalog := consul.Catalog()
+	n, qm, err := catalog.Nodes(consulOpts)
+	if err != nil {
+		return nil, nil, fmt.Errorf("catalog nodes: error fetching: %s", err)
 	}
 
 	log.Printf("[DEBUG] (%s) Consul returned %d nodes", d.Display(), len(n))
@@ -44,24 +53,26 @@ func (d *CatalogNodes) Fetch(client *api.Client, options *api.QueryOptions) (int
 			Address: node.Address,
 		})
 	}
+	sort.Stable(NodeList(nodes))
 
-	return nodes, qm, nil
+	rm := &ResponseMetadata{
+		LastIndex:   qm.LastIndex,
+		LastContact: qm.LastContact,
+	}
+
+	return nodes, rm, nil
 }
 
 func (d *CatalogNodes) HashCode() string {
-	return fmt.Sprintf("CatalogNodes|%s", d.Key())
-}
-
-func (d *CatalogNodes) Key() string {
-	return d.rawKey
+	return fmt.Sprintf("CatalogNodes|%s", d.rawKey)
 }
 
 func (d *CatalogNodes) Display() string {
 	if d.rawKey == "" {
-		return fmt.Sprintf("nodes")
+		return fmt.Sprintf(`"nodes"`)
 	}
 
-	return fmt.Sprintf(`nodes "%s"`, d.rawKey)
+	return fmt.Sprintf(`"nodes(%s)"`, d.rawKey)
 }
 
 // ParseCatalogNodes parses a string of the format @dc.
@@ -100,4 +111,15 @@ func ParseCatalogNodes(s ...string) (*CatalogNodes, error) {
 	default:
 		return nil, fmt.Errorf("expected 0 or 1 arguments, got %d", len(s))
 	}
+}
+
+type NodeList []*Node
+
+func (s NodeList) Len() int      { return len(s) }
+func (s NodeList) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+func (s NodeList) Less(i, j int) bool {
+	if s[i].Node == s[j].Node {
+		return s[i].Address <= s[j].Address
+	}
+	return s[i].Node <= s[j].Node
 }

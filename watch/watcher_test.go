@@ -1,152 +1,253 @@
 package watch
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	api "github.com/armon/consul-api"
-	"github.com/hashicorp/consul-template/dependency"
+	dep "github.com/hashicorp/consul-template/dependency"
 )
 
-func TestNewWatcher_noClient(t *testing.T) {
-	_, err := NewWatcher(nil, make([]dependency.Dependency, 1))
+var defaultWatcherConfig = &WatcherConfig{
+	Clients:   dep.NewClientSet(),
+	Once:      true,
+	RetryFunc: func(time.Duration) time.Duration { return 0 },
+}
+
+func TestNewWatcher_noConfig(t *testing.T) {
+	_, err := NewWatcher(nil)
 	if err == nil {
 		t.Fatal("expected error, but nothing was returned")
 	}
 
-	expected := "watcher: missing Consul API client"
+	expected := "watcher: missing config"
 	if !strings.Contains(err.Error(), expected) {
 		t.Errorf("expected %q to contain %q", err.Error(), expected)
 	}
 }
 
-func TestNewWatcher_noDependencies(t *testing.T) {
-	_, err := NewWatcher(&api.Client{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestNewWatcher_setsClient(t *testing.T) {
-	client := &api.Client{}
-	w, err := NewWatcher(client, make([]dependency.Dependency, 1))
+func TestNewWatcher_defaultValues(t *testing.T) {
+	w, err := NewWatcher(&WatcherConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if !reflect.DeepEqual(w.client, client) {
-		t.Errorf("expected %+v to equal %+v", w.client, client)
-	}
-}
-
-func TestNewWatcher_setsDependencies(t *testing.T) {
-	dependencies := []dependency.Dependency{
-		&dependency.HealthServices{},
-		&dependency.HealthServices{},
-	}
-	w, err := NewWatcher(&api.Client{}, dependencies)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !reflect.DeepEqual(w.dependencies, dependencies) {
-		t.Errorf("expected %q to equal %q", w.dependencies, dependencies)
-	}
-}
-
-func TestNewWatcher_makesDataCh(t *testing.T) {
-	w, err := NewWatcher(&api.Client{}, make([]dependency.Dependency, 1))
-	if err != nil {
-		t.Fatal(err)
+	if w.config.RetryFunc == nil {
+		t.Errorf("expected RetryFunc to not be nil")
 	}
 
 	if w.DataCh == nil {
 		t.Errorf("expected DataCh to exist")
 	}
-}
 
-func TestNewWatcher_makesErrCh(t *testing.T) {
-	w, err := NewWatcher(&api.Client{}, make([]dependency.Dependency, 1))
-	if err != nil {
-		t.Fatal(err)
+	if size := cap(w.DataCh); size != dataBufferSize {
+		t.Errorf("expected DataCh to have %d buffer, but was %d", dataBufferSize, size)
 	}
 
 	if w.ErrCh == nil {
 		t.Errorf("expected ErrCh to exist")
 	}
-}
-
-func TestNewWatcher_makesFinishCh(t *testing.T) {
-	w, err := NewWatcher(&api.Client{}, make([]dependency.Dependency, 1))
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	if w.FinishCh == nil {
 		t.Errorf("expected FinishCh to exist")
 	}
-}
 
-func TestNewWatcher_makesstopCh(t *testing.T) {
-	w, err := NewWatcher(&api.Client{}, make([]dependency.Dependency, 1))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if w.stopCh == nil {
-		t.Errorf("expected stopCh to exist")
+	if w.depViewMap == nil {
+		t.Errorf("expected depViewMap to exist")
 	}
 }
 
-func TestNewWatcher_setsRetry(t *testing.T) {
-	w, err := NewWatcher(&api.Client{}, make([]dependency.Dependency, 1))
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestNewWatcher_values(t *testing.T) {
+	clients := dep.NewClientSet()
 
-	if w.retryFunc == nil {
-		t.Errorf("expected retryFunc to exist")
-	}
-}
-
-func TestSetRetry_setsRetryFunc(t *testing.T) {
-	w, err := NewWatcher(&api.Client{}, make([]dependency.Dependency, 1))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	retry := 10 * time.Second
-	w.SetRetry(retry)
-	result := w.retryFunc(0 * time.Second)
-
-	if result != retry {
-		t.Errorf("expected %q to be %q", result, retry)
-	}
-}
-
-func TestSetRetryFunc_setsRetryFunc(t *testing.T) {
-	w, err := NewWatcher(&api.Client{}, make([]dependency.Dependency, 1))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	w.SetRetryFunc(func(current time.Duration) time.Duration {
-		return 2 * current
+	w, err := NewWatcher(&WatcherConfig{
+		Clients: clients,
+		Once:    true,
 	})
-
-	data := map[time.Duration]time.Duration{
-		0 * time.Second: 0 * time.Second,
-		1 * time.Second: 2 * time.Second,
-		2 * time.Second: 4 * time.Second,
-		9 * time.Second: 18 * time.Second,
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	for current, expected := range data {
-		result := w.retryFunc(current)
-		if result != expected {
-			t.Errorf("expected %q to be %q", result, expected)
+	if !reflect.DeepEqual(w.config.Clients, clients) {
+		t.Errorf("expected %#v to be %#v", w.config.Clients, clients)
+	}
+
+	if w.config.Once != true {
+		t.Errorf("expected w.config.Once to be true")
+	}
+}
+
+func TestAdd_updatesMap(t *testing.T) {
+	w, err := NewWatcher(defaultWatcherConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := &dep.Test{}
+	if _, err := w.Add(d); err != nil {
+		t.Fatal(err)
+	}
+
+	_, exists := w.depViewMap[d.HashCode()]
+	if !exists {
+		t.Errorf("expected Add to append to map")
+	}
+}
+
+func TestAdd_exists(t *testing.T) {
+	w, err := NewWatcher(defaultWatcherConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := &dep.Test{}
+	w.depViewMap[d.HashCode()] = &View{}
+
+	added, err := w.Add(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if added != false {
+		t.Errorf("expected Add to return false")
+	}
+}
+
+func TestAdd_error(t *testing.T) {
+	w, err := NewWatcher(defaultWatcherConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set the client to nil to force the view to return an error
+	w.config = nil
+
+	added, err := w.Add(&dep.Test{})
+	if err == nil {
+		t.Fatal("expected error, but nothing was returned")
+	}
+
+	expected := "view: missing config"
+	if err.Error() != expected {
+		t.Errorf("expected %q to be %q", err.Error(), expected)
+	}
+
+	if added != false {
+		t.Errorf("expected Add to return false")
+	}
+}
+
+func TestAdd_startsViewPoll(t *testing.T) {
+	w, err := NewWatcher(defaultWatcherConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	added, err := w.Add(&dep.Test{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if added != true {
+		t.Errorf("expected Add to return true")
+	}
+
+	select {
+	case err := <-w.ErrCh:
+		t.Fatal(err)
+	case <-w.DataCh:
+		// Got data, which means the poll was started
+	}
+}
+
+func TestWatching_notExists(t *testing.T) {
+	w, err := NewWatcher(defaultWatcherConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := &dep.Test{}
+	if w.Watching(d) == true {
+		t.Errorf("expected to not be watching")
+	}
+}
+
+func TestWatching_exists(t *testing.T) {
+	w, err := NewWatcher(defaultWatcherConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := &dep.Test{}
+	if _, err := w.Add(d); err != nil {
+		t.Fatal(err)
+	}
+
+	if w.Watching(d) == false {
+		t.Errorf("expected to be watching")
+	}
+}
+
+func TestRemove_exists(t *testing.T) {
+	w, err := NewWatcher(defaultWatcherConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := &dep.Test{}
+	if _, err := w.Add(d); err != nil {
+		t.Fatal(err)
+	}
+
+	removed := w.Remove(d)
+	if removed != true {
+		t.Error("expected Remove to return true")
+	}
+
+	if _, ok := w.depViewMap[d.HashCode()]; ok {
+		t.Error("expected dependency to be removed")
+	}
+}
+
+func TestRemove_doesNotExist(t *testing.T) {
+	w, err := NewWatcher(defaultWatcherConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	removed := w.Remove(&dep.Test{})
+	if removed != false {
+		t.Fatal("expected Remove to return false")
+	}
+}
+
+func TestSize_empty(t *testing.T) {
+	w, err := NewWatcher(defaultWatcherConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if w.Size() != 0 {
+		t.Errorf("expected %d to be %d", w.Size(), 0)
+	}
+}
+
+func TestSize_returnsNumViews(t *testing.T) {
+	w, err := NewWatcher(defaultWatcherConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 10; i++ {
+		d := &dep.Test{Name: fmt.Sprintf("%d", i)}
+		if _, err := w.Add(d); err != nil {
+			t.Fatal(err)
 		}
+	}
+
+	if w.Size() != 10 {
+		t.Errorf("expected %d to be %d", w.Size(), 10)
 	}
 }

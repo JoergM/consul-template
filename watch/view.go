@@ -6,44 +6,49 @@ import (
 	"reflect"
 	"time"
 
-	api "github.com/armon/consul-api"
-	"github.com/hashicorp/consul-template/dependency"
+	dep "github.com/hashicorp/consul-template/dependency"
 )
 
 const (
 	// The amount of time to do a blocking query for
 	defaultWaitTime = 60 * time.Second
-
-	// The amount of time to wait when Consul returns an error
-	defaultRetry = 1 * time.Second
 )
 
 // View is a representation of a Dependency and the most recent data it has
 // received from Consul.
 type View struct {
-	Dependency dependency.Dependency
+	// Dependency is the dependency that is associated with this View
+	Dependency dep.Dependency
 
+	// config is the configuration for the watcher that created this view and
+	// contains important information about how this view should behave when
+	// polling including retry functions and handling stale queries.
+	config *WatcherConfig
+
+	// Data is the most-recently-received data from Consul for this View
 	Data         interface{}
-	receivedData bool
-	lastIndex    uint64
+	ReceivedData bool
+	LastIndex    uint64
 
-	client *api.Client
+	// stopCh is used to stop polling on this View
+	stopCh chan struct{}
 }
 
 // NewView creates a new view object from the given Consul API client and
 // Dependency. If an error occurs, it will be returned.
-func NewView(client *api.Client, dep dependency.Dependency) (*View, error) {
-	if client == nil {
-		return nil, fmt.Errorf("view: missing Consul API client")
+func NewView(config *WatcherConfig, d dep.Dependency) (*View, error) {
+	if config == nil {
+		return nil, fmt.Errorf("view: missing config")
 	}
 
-	if dep == nil {
-		return nil, fmt.Errorf("view: missing Dependency")
+	if d == nil {
+		return nil, fmt.Errorf("view: missing dependency")
 	}
 
 	return &View{
-		client:     client,
-		Dependency: dep,
+		Dependency: d,
+		config:     config,
+		stopCh:     make(chan struct{}),
 	}, nil
 }
 
@@ -51,8 +56,8 @@ func NewView(client *api.Client, dep dependency.Dependency) (*View, error) {
 // accounts for interrupts on the interrupt channel. This allows the poll
 // function to be fired in a goroutine, but then halted even if the fetch
 // function is in the middle of a blocking query.
-func (v *View) poll(once bool, viewCh chan<- *View,
-	errCh chan<- error, stopCh <-chan struct{}, retryFunc RetryFunc) {
+func (v *View) poll(viewCh chan<- *View, errCh chan<- error) {
+	defaultRetry := v.config.RetryFunc(1 * time.Second)
 	currentRetry := defaultRetry
 
 	for {
@@ -65,31 +70,35 @@ func (v *View) poll(once bool, viewCh chan<- *View,
 			// have some successful requests
 			currentRetry = defaultRetry
 
-			log.Printf("[INFO] (%s) received data from consul", v.display())
-			viewCh <- v
+			log.Printf("[INFO] (view) %s received data from consul", v.display())
+			select {
+			case <-v.stopCh:
+			case viewCh <- v:
+			}
 
 			// If we are operating in once mode, do not loop - we received data at
 			// least once which is the API promise here.
-			if once {
+			if v.config.Once {
 				return
 			}
 		case err := <-fetchErrCh:
-			log.Printf("[ERR] (%s) %s", v.display(), err)
+			log.Printf("[ERR] (view) %s %s", v.display(), err)
 
-			// Intentionally do not send the error back up to the watcher and just
-			// retry. Eventually, once Consul API implements errwrap and multierror,
-			// we can check the "type" of error and conditionally alert back, but for
-			// now we will just swallow the error and continue.
-			// if err.Contains(Something) {
-			//   errCh <- err
-			// }
+			// Push the error back up to the watcher
+			select {
+			case <-v.stopCh:
+			case errCh <- err:
+			}
 
 			// Sleep and retry
-			currentRetry = retryFunc(currentRetry)
+			if v.config.RetryFunc != nil {
+				currentRetry = v.config.RetryFunc(currentRetry)
+			}
+			log.Printf("[INFO] (view) %s errored, retrying in %s", v.display(), currentRetry)
 			time.Sleep(currentRetry)
 			continue
-		case <-stopCh:
-			log.Printf("[DEBUG] (%s) stopping poll (received on stopCh)", v.display())
+		case <-v.stopCh:
+			log.Printf("[DEBUG] (view) %s stopping poll (received on view stopCh)", v.display())
 			return
 		}
 	}
@@ -101,39 +110,61 @@ func (v *View) poll(once bool, viewCh chan<- *View,
 // result of doneCh and errCh. It is assumed that only one instance of fetch
 // is running per View and therefore no locking or mutexes are used.
 func (v *View) fetch(doneCh chan<- struct{}, errCh chan<- error) {
-	log.Printf("[DEBUG] (%s) starting fetch", v.display())
+	log.Printf("[DEBUG] (view) %s starting fetch", v.display())
+
+	var allowStale bool
+	if v.config.MaxStale != 0 {
+		allowStale = true
+	}
 
 	for {
-		options := &api.QueryOptions{
-			WaitTime:  defaultWaitTime,
-			WaitIndex: v.lastIndex,
+		opts := &dep.QueryOptions{
+			AllowStale: allowStale,
+			WaitTime:   defaultWaitTime,
+			WaitIndex:  v.LastIndex,
 		}
-		data, qm, err := v.Dependency.Fetch(v.client, options)
+		data, rm, err := v.Dependency.Fetch(v.config.Clients, opts)
 		if err != nil {
 			errCh <- err
 			return
 		}
 
-		if qm == nil {
-			errCh <- fmt.Errorf("consul returned nil qm; this should never happen" +
-				"and is probably a bug in consul-template or consulapi")
+		if rm == nil {
+			errCh <- fmt.Errorf("consul returned nil response metadata; this " +
+				"should never happen and is probably a bug in consul-template")
 			return
 		}
 
-		if qm.LastIndex == v.lastIndex {
-			log.Printf("[DEBUG] (%s) no new data (index was the same)", v.display())
+		if allowStale && rm.LastContact > v.config.MaxStale {
+			allowStale = false
+			log.Printf("[DEBUG] (view) %s stale data (last contact exceeded max_stale)", v.display())
 			continue
 		}
 
-		v.lastIndex = qm.LastIndex
+		if v.config.MaxStale != 0 {
+			allowStale = true
+		}
 
-		if v.receivedData && reflect.DeepEqual(data, v.Data) {
-			log.Printf("[DEBUG] (%s) no new data (contents were the same)", v.display())
+		if rm.LastIndex == v.LastIndex {
+			log.Printf("[DEBUG] (view) %s no new data (index was the same)", v.display())
+			continue
+		}
+
+		if rm.LastIndex < v.LastIndex {
+			log.Printf("[DEBUG] (view) %s had a lower index, resetting", v.display())
+			v.LastIndex = 0
+			continue
+		}
+
+		v.LastIndex = rm.LastIndex
+
+		if v.ReceivedData && reflect.DeepEqual(data, v.Data) {
+			log.Printf("[DEBUG] (view) %s no new data (contents were the same)", v.display())
 			continue
 		}
 
 		v.Data = data
-		v.receivedData = true
+		v.ReceivedData = true
 		close(doneCh)
 		return
 	}
@@ -142,4 +173,9 @@ func (v *View) fetch(doneCh chan<- struct{}, errCh chan<- error) {
 // display returns a string that represents this view.
 func (v *View) display() string {
 	return v.Dependency.Display()
+}
+
+// stop halts polling of this view.
+func (v *View) stop() {
+	close(v.stopCh)
 }

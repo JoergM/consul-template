@@ -6,15 +6,8 @@ import (
 	"sync"
 	"time"
 
-	api "github.com/armon/consul-api"
-	"github.com/hashicorp/consul-template/dependency"
+	dep "github.com/hashicorp/consul-template/dependency"
 )
-
-// defaultRetryFunc is the default return function, which just echos whatever
-// duration it was given.
-var defaultRetryFunc RetryFunc = func(t time.Duration) time.Duration {
-	return t
-}
 
 // RetryFunc is a function that defines the retry for a given watcher. The
 // function parameter is the current retry (which might be nil), and the
@@ -22,41 +15,57 @@ var defaultRetryFunc RetryFunc = func(t time.Duration) time.Duration {
 // functions that are based off the previous values.
 type RetryFunc func(time.Duration) time.Duration
 
+// DefaultRetryFunc is the default return function, which just echos whatever
+// duration it was given.
+var DefaultRetryFunc RetryFunc = func(t time.Duration) time.Duration {
+	return t
+}
+
+// dataBufferSize is the default number of views to process in a batch.
+const dataBufferSize = 2048
+
+// Watcher is a top-level manager for views that poll Consul for data.
 type Watcher struct {
 	sync.Mutex
 
-	// DataCh is the chan where Views will be published
+	// DataCh is the chan where Views will be published.
 	DataCh chan *View
 
-	// ErrCh is the chan where any errors will be published
+	// ErrCh is the chan where any errors will be published.
 	ErrCh chan error
 
-	// FinishCh is the chan where the watcher reports it is "done"
+	// FinishCh is the chan where the watcher reports it is "done".
 	FinishCh chan struct{}
 
-	// stopCh is a chan that is only published when polling should stop
-	stopCh chan struct{}
+	// config is the internal configuration of this watcher.
+	config *WatcherConfig
 
-	// client is the mechanism for communicating with the Consul API
-	client *api.Client
-
-	// dependencies is the slice of Dependencies this Watcher will poll
-	dependencies []dependency.Dependency
-
-	// retryFunc is a RetryFunc that represents the way retrys and backoffs
-	// should occur.
-	retryFunc RetryFunc
-
-	// waitGroup is the WaitGroup to ensure all Go routines return when we stop
-	waitGroup sync.WaitGroup
+	// depViewMap is a map of Templates to Views. Templates are keyed by
+	// HashCode().
+	depViewMap map[string]*View
 }
 
-//
-func NewWatcher(client *api.Client, dependencies []dependency.Dependency) (*Watcher, error) {
-	watcher := &Watcher{
-		client:       client,
-		dependencies: dependencies,
-	}
+// WatcherConfig is the configuration for a particular Watcher.
+type WatcherConfig struct {
+	// Client is the mechanism for communicating with the Consul API.
+	Clients *dep.ClientSet
+
+	// Once is used to determine if the views should poll for data exactly once.
+	Once bool
+
+	// MaxStale is the maximum staleness of a query. If specified, Consul will
+	// distribute work among all servers instead of just the leader. Specifying
+	// this option assumes the use of AllowStale.
+	MaxStale time.Duration
+
+	// RetryFunc is a RetryFunc that represents the way retrys and backoffs
+	// should occur.
+	RetryFunc RetryFunc
+}
+
+// NewWatcher creates a new watcher using the given API client.
+func NewWatcher(config *WatcherConfig) (*Watcher, error) {
+	watcher := &Watcher{config: config}
 	if err := watcher.init(); err != nil {
 		return nil, err
 	}
@@ -64,86 +73,109 @@ func NewWatcher(client *api.Client, dependencies []dependency.Dependency) (*Watc
 	return watcher, nil
 }
 
-// SetRetry is used to set the retry to a static value. See SetRetryFunc for
-// more informatoin.
-func (w *Watcher) SetRetry(duration time.Duration) {
-	w.SetRetryFunc(func(current time.Duration) time.Duration {
-		return duration
-	})
-}
-
-// SetRetryFunc is used to set a dynamic retry function. Only new views created
-// after this function has been set will inherit the new retry functionality.
-// Existing views will use the retry functionality with which they were created.
-func (w *Watcher) SetRetryFunc(f RetryFunc) {
+// Add adds the given dependency to the list of monitored depedencies
+// and start the associated view. If the dependency already exists, no action is
+// taken.
+//
+// If the Dependency already existed, it this function will return false. If the
+// view was successfully created, it will return true. If an error occurs while
+// creating the view, it will be returned here (but future errors returned by
+// the view will happen on the channel).
+func (w *Watcher) Add(d dep.Dependency) (bool, error) {
 	w.Lock()
 	defer w.Unlock()
-	w.retryFunc = f
+
+	log.Printf("[INFO] (watcher) adding %s", d.Display())
+
+	if _, ok := w.depViewMap[d.HashCode()]; ok {
+		log.Printf("[DEBUG] (watcher) %s already exists, skipping", d.Display())
+		return false, nil
+	}
+
+	v, err := NewView(w.config, d)
+	if err != nil {
+		return false, err
+	}
+
+	log.Printf("[DEBUG] (watcher) %s starting", d.Display())
+
+	w.depViewMap[d.HashCode()] = v
+	go v.poll(w.DataCh, w.ErrCh)
+
+	return true, nil
 }
 
-// Watch creates a series of Consul views which poll for data in parallel. If
-// the `once` flag is true, each view will return data (or an error) exactly
-// once and terminate. If the `once` flag is false, views will continue to poll
-// indefinitely unless they encounter an irrecoverable error.
-func (w *Watcher) Watch(once bool) {
-	log.Printf("[DEBUG] (watcher) starting watch")
+// Watching determines if the given dependency is being watched.
+func (w *Watcher) Watching(d dep.Dependency) bool {
+	w.Lock()
+	defer w.Unlock()
 
-	// Create the views
-	views := make([]*View, 0, len(w.dependencies))
-	for _, dep := range w.dependencies {
-		view, err := NewView(w.client, dep)
-		if err != nil {
-			w.ErrCh <- err
-			return
-		}
+	_, ok := w.depViewMap[d.HashCode()]
+	return ok
+}
 
-		views = append(views, view)
+// Remove removes the given dependency from the list and stops the
+// associated View. If a View for the given dependency does not exist, this
+// function will return false. If the View does exist, this function will return
+// true upon successful deletion.
+func (w *Watcher) Remove(d dep.Dependency) bool {
+	w.Lock()
+	defer w.Unlock()
+
+	log.Printf("[INFO] (watcher) removing %s", d.Display())
+
+	if view, ok := w.depViewMap[d.HashCode()]; ok {
+		log.Printf("[DEBUG] (watcher) actually removing %s", d.Display())
+		view.stop()
+		delete(w.depViewMap, d.HashCode())
+		return true
 	}
 
-	// Poll on all the views
-	for _, v := range views {
-		w.waitGroup.Add(1)
-		go func(once bool, v *View) {
-			defer w.waitGroup.Done()
-			v.poll(once, w.DataCh, w.ErrCh, w.stopCh, w.retryFunc)
-		}(once, v)
-	}
+	log.Printf("[DEBUG] (watcher) %s did not exist, skipping", d.Display())
+	return false
+}
 
-	// Wait for them to stop
-	log.Printf("[DEBUG] (watcher) all pollers have started, waiting for finish")
-	w.waitGroup.Wait()
-
-	// Close everything up
-	if once {
-		log.Printf("[DEBUG] (watcher) closing finish channel")
-		close(w.FinishCh)
-	}
+// Size returns the number of views this watcher is watching.
+func (w *Watcher) Size() int {
+	w.Lock()
+	defer w.Unlock()
+	return len(w.depViewMap)
 }
 
 // Stop halts this watcher and any currently polling views immediately. If a
 // view was in the middle of a poll, no data will be returned.
 func (w *Watcher) Stop() {
-	close(w.stopCh)
+	w.Lock()
+	defer w.Unlock()
+
+	log.Printf("[INFO] (watcher) stopping all views")
+
+	for _, view := range w.depViewMap {
+		log.Printf("[DEBUG] (watcher) stopping %s", view.Dependency.Display())
+		view.stop()
+	}
+
+	// Reset the map to have no views
+	w.depViewMap = make(map[string]*View)
 }
 
-//
+// init sets up the initial values for the watcher.
 func (w *Watcher) init() error {
-	if w.client == nil {
-		return fmt.Errorf("watcher: missing Consul API client")
+	if w.config == nil {
+		return fmt.Errorf("watcher: missing config")
 	}
 
-	if len(w.dependencies) == 0 {
-		log.Printf("[WARN] (watcher) no dependencies in template(s)")
+	if w.config.RetryFunc == nil {
+		w.config.RetryFunc = DefaultRetryFunc
 	}
-
-	// Setup the default retry
-	w.SetRetryFunc(defaultRetryFunc)
 
 	// Setup the channels
-	w.DataCh = make(chan *View)
+	w.DataCh = make(chan *View, dataBufferSize)
 	w.ErrCh = make(chan error)
 	w.FinishCh = make(chan struct{})
-	w.stopCh = make(chan struct{})
+
+	// Setup our map of dependencies to views
+	w.depViewMap = make(map[string]*View)
 
 	return nil
 }
